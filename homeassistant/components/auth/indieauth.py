@@ -13,6 +13,7 @@ import aiohttp
 import aiohttp.client_exceptions
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import MAXIMUM_HEADER_SIZE
 from homeassistant.util.network import is_local
 
 _LOGGER = logging.getLogger(__name__)
@@ -209,8 +210,13 @@ async def fetch_redirect_uris(hass: HomeAssistant, url: str) -> list[str]:
     status: int | None = None
     redirected = False
     try:
+        # Some OAuth client metadata hosts send Content-Security-Policy headers
+        # larger than aiohttp's 8190-byte default; match the shared HA client limit.
         async with (
-            aiohttp.ClientSession() as session,
+            aiohttp.ClientSession(
+                max_line_size=MAXIMUM_HEADER_SIZE,
+                max_field_size=MAXIMUM_HEADER_SIZE,
+            ) as session,
             session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp,
         ):
             status = resp.status
@@ -235,8 +241,8 @@ async def fetch_redirect_uris(hass: HomeAssistant, url: str) -> list[str]:
             "Low level connection error while looking up redirect_uri %s", url
         )
         return []
-    except aiohttp.client_exceptions.ClientError:
-        _LOGGER.error("Unknown error while looking up redirect_uri %s", url)
+    except aiohttp.client_exceptions.ClientError as err:
+        _LOGGER.error("Unknown error while looking up redirect_uri %s: %s", url, err)
         return []
 
     if redirect_uris := _parse_link_tag_redirect_uris(url, body):

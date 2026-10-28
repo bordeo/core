@@ -1,18 +1,69 @@
 """Tests for the client validator."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from datetime import timedelta
+from ipaddress import ip_address
 import json
+import logging
+from pathlib import Path
+import ssl
+from typing import Any
 from unittest.mock import patch
 
 import aiohttp
+from aiohttp import web
+from aiohttp.test_utils import TestServer
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 import pytest
 from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
 
 from homeassistant.components.auth import indieauth
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 REQUEST_SCHEME = "https"
 REQUEST_NETLOC = "homeassistant.example"
+
+# Larger than aiohttp's default ClientSession max_field_size (8190).
+_LARGE_HEADER_VALUE = "x" * 9300
+
+
+def _self_signed_server_ssl(tmp_path: Path) -> ssl.SSLContext:
+    """Build a loopback TLS context for TestServer."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = dt_util.utcnow()
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "indieauth-server.pem"
+    key_path = tmp_path / "indieauth-server.key"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert_path, key_path)
+    return server_context
 
 
 @pytest.fixture
@@ -1052,12 +1103,71 @@ async def test_fetch_redirect_uris_metadata_document_at_cap_ineligible(
 
 
 async def test_fetch_redirect_uris_network_error(
-    hass: HomeAssistant, mock_session: AiohttpClientMocker
+    hass: HomeAssistant,
+    mock_session: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Test a network error yields no redirect uris without raising."""
-    mock_session.get("https://example.com/client", exc=aiohttp.ClientError())
+    mock_session.get(
+        "https://example.com/client",
+        exc=aiohttp.ClientError("Got more than 8190 bytes when reading"),
+    )
 
-    assert await indieauth.fetch_redirect_uris(hass, "https://example.com/client") == []
+    with caplog.at_level(logging.ERROR):
+        assert (
+            await indieauth.fetch_redirect_uris(hass, "https://example.com/client")
+            == []
+        )
+
+    assert "Unknown error while looking up redirect_uri https://example.com/client" in (
+        caplog.text
+    )
+    assert "Got more than 8190 bytes when reading" in caplog.text
+
+
+@pytest.mark.usefixtures("socket_enabled")
+async def test_fetch_redirect_uris_metadata_document_large_header(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    aiohttp_server: Callable[..., Awaitable[TestServer]],
+) -> None:
+    """Test metadata documents are readable when response headers exceed 8190 bytes."""
+
+    async def handler(request: web.Request) -> web.Response:
+        """Return a client ID metadata document with an oversized CSP header."""
+        client_id = str(request.url)
+        return web.Response(
+            text=json.dumps(
+                {
+                    "client_id": client_id,
+                    "redirect_uris": ["https://example.com/oauth/callback"],
+                }
+            ),
+            headers={
+                "Content-Type": "application/json",
+                "Content-Security-Policy": _LARGE_HEADER_VALUE,
+            },
+        )
+
+    app = web.Application()
+    app.router.add_get("/oauth/client.json", handler)
+    server = await aiohttp_server(app, ssl=_self_signed_server_ssl(tmp_path))
+    url = str(server.make_url("/oauth/client.json"))
+
+    # Accept the test server's self-signed certificate without changing the
+    # max_field_size / max_line_size kwargs production code passes in.
+    real_init = aiohttp.ClientSession.__init__
+
+    def client_session_init(
+        self: aiohttp.ClientSession, *args: Any, **kwargs: Any
+    ) -> None:
+        kwargs["connector"] = aiohttp.TCPConnector(ssl=False)
+        real_init(self, *args, **kwargs)
+
+    with patch.object(aiohttp.ClientSession, "__init__", client_session_init):
+        redirect_uris = await indieauth.fetch_redirect_uris(hass, url)
+
+    assert redirect_uris == ["https://example.com/oauth/callback"]
 
 
 @pytest.mark.parametrize(
